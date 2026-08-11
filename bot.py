@@ -3110,21 +3110,30 @@ def bayesian_fusion(features):
         log_odds     += log_ratio * w
         total_weight += abs(w)
 
-    # ── FIX v2: Direction balance correction ──────────────────────────────
-    # If recent signals are >80% one-directional it almost certainly reflects
-    # a structural layer bias rather than a genuine edge. A soft correction
-    # pushes log_odds back toward zero (capped at ±0.5 so it cannot flip a
-    # genuinely strong signal). The root-cause fix (Hurst on returns) removes
-    # the bias at source; this is a safety net against future regressions.
+    log_odds = apply_direction_balance_correction(log_odds, features)
+
+    p_up       = float(np.clip(1.0 / (1.0 + math.exp(-log_odds)), 0.01, 0.99))
+    confidence = abs(p_up - 0.5) * 2.0 * total_trust
+    return p_up, confidence
+
+
+# ---------------------------------------------------------------------------
+# FIX v2 (extracted): Direction balance correction, shared by every signal
+# fusion path (bayesian_fusion and MetaLearner). If recent trade directions
+# are >80% one-sided it almost certainly reflects a structural layer bias
+# rather than genuine one-sided edge. A soft correction pushes log_odds back
+# toward zero, capped at ±0.5 so it cannot flip a genuinely strong signal.
+# Originally lived only inside bayesian_fusion — MetaLearner.predict() had no
+# equivalent, so the guardrail silently vanished for any symbol that crossed
+# META_MIN_SAMPLES. Now applied to both paths' log-odds before the sigmoid.
+# ---------------------------------------------------------------------------
+def apply_direction_balance_correction(log_odds: float, features: dict) -> float:
     direction_ratio = float(features.get("recent_call_ratio", 0.5))
     if direction_ratio > 0.80:
         log_odds -= float(np.clip((direction_ratio - 0.80) * 5.0, 0.0, 0.5))
     elif direction_ratio < 0.20:
         log_odds += float(np.clip((0.20 - direction_ratio) * 5.0, 0.0, 0.5))
-
-    p_up       = float(np.clip(1.0 / (1.0 + math.exp(-log_odds)), 0.01, 0.99))
-    confidence = abs(p_up - 0.5) * 2.0 * total_trust
-    return p_up, confidence
+    return log_odds
 
 
 # ---------------------------------------------------------------------------
@@ -3607,7 +3616,15 @@ def fuse_signal(features: dict, state: "TradeState",
     if meta_p is not None:
         # Meta-learner path
         n = len(state.meta_buffer[symbol])
-        p_up = meta_p
+        # Apply the same direction-balance guardrail bayesian_fusion uses —
+        # convert meta_p to log-odds, correct, convert back. Without this the
+        # bias-correction safety net silently disappeared for any symbol
+        # that crossed META_MIN_SAMPLES, since MetaLearner.predict() has no
+        # equivalent of its own.
+        meta_p_clipped = float(np.clip(meta_p, 1e-3, 1 - 1e-3))
+        meta_log_odds = math.log(meta_p_clipped / (1 - meta_p_clipped))
+        meta_log_odds = apply_direction_balance_correction(meta_log_odds, features)
+        p_up = float(np.clip(1.0 / (1.0 + math.exp(-meta_log_odds)), 0.01, 0.99))
         confidence = abs(p_up - 0.5) * 2.0 * features.get("vol_trust", 1.0) \
                      * features.get("entropy_trust", 1.0)
         if n >= META_MIN_SAMPLES and n % 200 == 0:
