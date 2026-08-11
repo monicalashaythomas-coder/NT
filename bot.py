@@ -598,6 +598,58 @@ class SupabaseStore:
         print(f"[Store] Warm-started state for {len(rows)} symbols from Supabase.")
 
 
+    # ── Meta-learner persistence ────────────────────────────────────────────
+    # meta_weights/meta_bias/meta_buffer previously lived only in TradeState
+    # (in-memory), so every Railway restart reset them to zero regardless of
+    # META_MIN_SAMPLES — the meta-learner could never accumulate enough
+    # durable samples to activate across redeploys. This persists all three
+    # per symbol so progress survives restarts.
+    #
+    # meta_buffer entries are (np.ndarray, float) tuples; we serialize the
+    # array as a plain list for JSON. Buffer is capped at 2000 by its deque
+    # maxlen already, so payload size stays bounded (~17 floats x 2000 rows
+    # x 3 symbols — a few hundred KB at most, well within Supabase limits).
+    def save_meta_state(self, state):
+        if not self.ok:
+            return
+        for symbol, w in state.meta_weights.items():
+            buf = state.meta_buffer.get(symbol)
+            buf_payload = [[x.tolist(), float(y)] for x, y in buf] if buf else []
+            self._upsert("bot_meta_state", {
+                "symbol":      symbol,
+                "meta_weights": json.dumps(w.tolist()),
+                "meta_bias":    float(state.meta_bias.get(symbol, 0.0)),
+                "meta_buffer":  json.dumps(buf_payload),
+                "buffer_len":   len(buf_payload),
+                "updated_at":   datetime.utcnow().isoformat(),
+            })
+        if state.meta_weights:
+            print(f"[Store] Saved meta-learner state for "
+                  f"{len(state.meta_weights)} symbols to Supabase.")
+
+    def load_meta_state(self, state):
+        rows = self._select("bot_meta_state")
+        if not rows:
+            print("[Store] No prior meta-learner state found — cold start.")
+            return
+        for row in rows:
+            s = row["symbol"]
+            raw_w = row.get("meta_weights") or "[]"
+            w = json.loads(raw_w) if isinstance(raw_w, str) else (raw_w or [])
+            if w:
+                state.meta_weights[s] = np.array(w, dtype=float)
+            state.meta_bias[s] = float(row.get("meta_bias", 0.0))
+            raw_buf = row.get("meta_buffer") or "[]"
+            buf = json.loads(raw_buf) if isinstance(raw_buf, str) else (raw_buf or [])
+            if buf:
+                state.meta_buffer[s] = deque(
+                    ((np.array(x, dtype=float), float(y)) for x, y in buf),
+                    maxlen=2000,
+                )
+        total_samples = sum(len(state.meta_buffer.get(r["symbol"], [])) for r in rows)
+        print(f"[Store] Warm-started meta-learner state for {len(rows)} symbols "
+              f"from Supabase ({total_samples} total buffered samples).")
+
     def save_global_state(self, state):
         """Persist global (non-per-symbol) self-improvement state.
         FIX v3: also persist balance peak for drawdown tracking.
@@ -754,6 +806,7 @@ class TradeState:
         # None = not enough data yet, falls back to Bayesian fusion.
         self.meta_weights: Dict[str, np.ndarray] = {}
         self.meta_bias:    Dict[str, float]       = {}
+        self.last_meta_save: float = 0.0   # throttle for heartbeat meta-state saves
         # Ring buffer of (layer_vector, outcome) training examples per symbol
         self.meta_buffer:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=2000))
 
@@ -4503,6 +4556,7 @@ async def deep_startup_calibration(state, symbol_data, symbols):
     if _store is not None:
         _store.save_symbol_state(state)
         _store.save_global_state(state)
+        _store.save_meta_state(state)
         _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
                           MIN_EXP_WIN_RATE, state.adaptive_threshold)
     autotune_gates(state)
@@ -4625,6 +4679,7 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
     if _store is not None:
         _store.save_symbol_state(state)
         _store.save_global_state(state)
+        _store.save_meta_state(state)
         _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
                           MIN_EXP_WIN_RATE, state.adaptive_threshold)
     autotune_gates(state)
@@ -4705,6 +4760,7 @@ async def main():
     _store = SupabaseStore()
     _store.load_symbol_state(state)
     _store.load_global_state(state)   # FIX v2: restore direction_history
+    _store.load_meta_state(state)     # restore meta-learner weights/buffer
     gates = _store.load_gates()
     if gates:
         MIN_LAYER_AGREE    = int(gates.get("min_layer_agree",    MIN_LAYER_AGREE))
@@ -4813,6 +4869,15 @@ async def main():
             # entries in the global_state table after a full session).
             if _store is not None and len(state.direction_history) > 0:
                 _store.save_global_state(state)
+            # Meta-learner buffer/weights persisted every ~5min (10 heartbeats)
+            # rather than every 30s — the buffer payload is larger than
+            # direction_history, so this cadence balances durability against
+            # Supabase write volume. Also saved on every calibration cycle
+            # above, so this just covers the gap between calibrations.
+            if _store is not None and state.meta_weights:
+                if now - state.last_meta_save > 300:
+                    _store.save_meta_state(state)
+                    state.last_meta_save = now
 
         if not ready_symbols:
             continue
