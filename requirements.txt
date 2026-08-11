@@ -1,0 +1,7 @@
+numpy>=1.26,<2.0
+scipy>=1.11
+statsmodels>=0.14
+hmmlearn>=0.3
+arch>=6.3
+requests>=2.31
+websockets>=12.0
