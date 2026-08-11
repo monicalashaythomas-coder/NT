@@ -1366,15 +1366,58 @@ async def buy_contract(client, symbol, direction, duration, duration_unit,
     return resp["buy"]["contract_id"]
 
 
-async def wait_for_contract_result(client, contract_id):
+async def wait_for_contract_result(client, contract_id, poll_interval=15, max_wait=120):
+    """
+    Waits for a contract to settle. Primarily listens on the
+    proposal_open_contract subscription push, but falls back to actively
+    polling via a plain (non-subscribed) request if no push arrives within
+    poll_interval seconds.
+
+    ROOT CAUSE FIX: previously this was `while True: data = await q.get()`
+    with no timeout at all. Live incident: after a TRADE SIGNAL, the bot
+    froze completely — no further scans, no heartbeats, nothing — because
+    a subscription push never arrived (WS reconnect / dropped frame) and
+    this coroutine waited on an empty queue forever. Since the main scan
+    loop awaits this directly, one silently-dropped push message froze the
+    entire process indefinitely, even though execute_single_step already
+    has a graceful `except Exception` handler around this call — that
+    handler was never reached because nothing ever raised.
+
+    Bounded by max_wait as an absolute safety cap: if a result still can't
+    be confirmed by then, raises TimeoutError so the caller's existing
+    exception handler can record a safe $0 outcome and unlock trading,
+    instead of hanging forever.
+    """
     q = client.subscribe_channel("proposal_open_contract")
     await client.send({"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 1})
-    while True:
-        data = await q.get()
-        poc = data.get("proposal_open_contract", {})
-        if poc.get("contract_id") == contract_id and poc.get("is_sold"):
-            profit = float(poc.get("profit", 0))
-            return profit > 0, profit
+    waited = 0.0
+    while waited < max_wait:
+        try:
+            data = await asyncio.wait_for(q.get(), timeout=poll_interval)
+            poc = data.get("proposal_open_contract", {})
+            if poc.get("contract_id") == contract_id and poc.get("is_sold"):
+                profit = float(poc.get("profit", 0))
+                return profit > 0, profit
+        except asyncio.TimeoutError:
+            waited += poll_interval
+            # Push didn't arrive in time — actively poll instead, via the
+            # plain req/resp path (its own 20s timeout in client.send),
+            # independent of the subscription/queue mechanism that stalled.
+            try:
+                resp = await client.send(
+                    {"proposal_open_contract": 1, "contract_id": contract_id}
+                )
+                poc = resp.get("proposal_open_contract", {})
+                if poc.get("is_sold"):
+                    profit = float(poc.get("profit", 0))
+                    return profit > 0, profit
+            except Exception as e:
+                vlog(f"[wait_for_contract_result] poll fallback error: "
+                     f"{type(e).__name__}: {e}")
+    raise TimeoutError(
+        f"Contract {contract_id} did not settle within {max_wait}s — "
+        f"giving up rather than freezing indefinitely."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3973,11 +4016,23 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
                 stake,
                 barrier_rel=notouch_entry["barrier_rel"],
             )
+            # NOTOUCH durations are in minutes/hours/days, not ticks — give
+            # the settlement watcher enough room (contract length + 15min
+            # buffer) rather than the flat cap used for Rise/Fall.
+            unit_seconds = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+            contract_seconds = notouch_entry["dur_val"] * unit_seconds.get(
+                notouch_entry["dur_unit"], 60
+            )
+            settle_max_wait = contract_seconds + 900
         else:
             # ── Rise/Fall fallback ──────────────────────────────────────────
             contract_id = await buy_contract(
                 client, symbol, direction, int(duration), "t", stake
             )
+            # Tick-based contracts settle within seconds — 120s (2min) is
+            # generous headroom without leaving the bot parked too long on
+            # a genuinely stuck subscription.
+            settle_max_wait = 120
     except Exception as e:
         # FIX v4: buy_contract raising (insufficient balance, symbol closed,
         # transient API error, etc.) means NO contract was ever purchased —
@@ -3997,7 +4052,9 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
     # everything from here on is a genuine attempted trade regardless of
     # how its outcome resolves.
     try:
-        won, profit = await wait_for_contract_result(client, contract_id)
+        won, profit = await wait_for_contract_result(
+            client, contract_id, max_wait=settle_max_wait
+        )
         # Store for Supabase logging in the post-trade path
         state._last_notouch_entry = notouch_entry
         log_trade(symbol, direction, stake, won, profit, step)
