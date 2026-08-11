@@ -353,6 +353,14 @@ ALLOWED_DIRECTIONS = {
     "RDBEAR": (-1,),     # Fall (PUT) only
 }
 
+# v4.1 — DUAL CONTRACT-TYPE SYMBOLS: for symbols listed here, each cycle
+# evaluates BOTH a Rise/Fall contract (via monte_carlo_duration) AND a
+# NOTOUCH contract (via mc_notouch_scan + select_best_notouch, using real
+# Deriv payout quotes) for the resolved direction, and fires whichever has
+# the higher actual expected value. Symbols not listed here behave exactly
+# as in the v4 Rise/Fall-only build.
+NOTOUCH_DUAL_SYMBOLS = {"RDBEAR"}
+
 # =============================================================================
 # NO TOUCH CONTRACT CONFIGURATION  (legacy — unused in the v4 Rise/Fall
 # multi-symbol build below; kept in case a NOTOUCH-mode symbol is added back)
@@ -5052,14 +5060,49 @@ async def main():
                 sd.prices(), live_returns, direction, feats, CANDIDATE_DURATIONS,
                 models=state.model_cache.get(s)
             )
-            if exp_win < MIN_EXP_WIN_RATE:
+            rf_payout = empirical_payout(state, s)
+            rf_ev     = exp_win * rf_payout - (1 - exp_win)
+            rf_ok     = exp_win >= MIN_EXP_WIN_RATE
+
+            # v4.1 — dual contract-type evaluation. For symbols in
+            # NOTOUCH_DUAL_SYMBOLS, also scan NOTOUCH candidates for the
+            # same resolved direction and compare real EV against the
+            # Rise/Fall EV above; fire whichever is actually better this
+            # cycle rather than always defaulting to Rise/Fall.
+            notouch_entry = None
+            if s in NOTOUCH_DUAL_SYMBOLS:
+                nt_candidates = mc_notouch_scan(
+                    sd.prices(), live_returns, feats, direction, sd
+                )
+                nt_best = None
+                if nt_candidates:
+                    nt_best = await select_best_notouch(
+                        client, s, nt_candidates, direction
+                    )
+                if nt_best is not None and (not rf_ok or nt_best["ev"] > rf_ev):
+                    notouch_entry = nt_best
+                    duration = nt_best["dur_val"]     # for logging/allocator passthrough
+                    exp_win  = nt_best["p_no_touch"]
+                    vlog(f"[ContractSelect] {s} — NOTOUCH chosen "
+                         f"(EV={nt_best['ev']:+.3f} vs Rise/Fall EV={rf_ev:+.3f})")
+                elif rf_ok:
+                    vlog(f"[ContractSelect] {s} — Rise/Fall chosen "
+                         f"(EV={rf_ev:+.3f}"
+                         + (f" vs NOTOUCH EV={nt_best['ev']:+.3f}" if nt_best else " — no NOTOUCH candidate cleared its EV floor")
+                         + ")")
+                else:
+                    vlog(f"[MC] {s} skipped — neither Rise/Fall "
+                         f"(exp_win={exp_win:.3f} < {MIN_EXP_WIN_RATE}) nor NOTOUCH "
+                         f"cleared their EV floors this cycle")
+                    continue
+            elif not rf_ok:
                 vlog(f"[MC] {s} skipped — best duration={duration}t "
                      f"exp_win={exp_win:.3f} < floor {MIN_EXP_WIN_RATE}")
                 continue
 
             portfolio_candidates.append((
                 s, direction, float(p_up), float(confidence),
-                n_agree, duration, exp_win, feats
+                n_agree, duration, exp_win, feats, notouch_entry
             ))
 
         if not portfolio_candidates:
@@ -5071,7 +5114,7 @@ async def main():
         # is the signal-quality proxy it uses for Kelly sizing.
         alloc_input = [
             (s, direction, p_up, conf, exp_win, duration)
-            for s, direction, p_up, conf, _n_agree, duration, exp_win, _feats
+            for s, direction, p_up, conf, _n_agree, duration, exp_win, _feats, _nt
             in portfolio_candidates
         ]
         allocations = PortfolioAllocator.allocate(
@@ -5096,16 +5139,24 @@ async def main():
             )
             if cand_row is None:
                 continue
-            _, _, p_up_sym, conf_sym, _, dur_sym, exp_win_sym, feats_sym = cand_row
+            (_, _, p_up_sym, conf_sym, _, dur_sym, exp_win_sym, feats_sym,
+             notouch_entry_sym) = cand_row
 
             reset_sequence_accumulator(state, state.balance, p_up_sym, conf_sym,
                                         dur_sym)
             state.last_step0_time = time.time()
 
-            print(f"TRADE SIGNAL | {symbol} "
-                  f"{'CALL (Rise)' if direction > 0 else 'PUT (Fall)'} | "
-                  f"dur={dur_sym}t | P(win)={exp_win_sym:.3f} | "
-                  f"stake={base_stake:.2f}")
+            if notouch_entry_sym is not None:
+                print(f"TRADE SIGNAL | {symbol} NOTOUCH "
+                      f"barrier={notouch_entry_sym['barrier_rel']} | "
+                      f"dur={notouch_entry_sym['dur_val']}{notouch_entry_sym['dur_unit']} | "
+                      f"P(no_touch)={exp_win_sym:.3f} | EV={notouch_entry_sym['ev']:+.3f} | "
+                      f"stake={base_stake:.2f}")
+            else:
+                print(f"TRADE SIGNAL | {symbol} "
+                      f"{'CALL (Rise)' if direction > 0 else 'PUT (Fall)'} | "
+                      f"dur={dur_sym}t | P(win)={exp_win_sym:.3f} | "
+                      f"stake={base_stake:.2f}")
 
             state.open_positions[symbol] = {
                 "direction": direction,
@@ -5117,6 +5168,7 @@ async def main():
                 client, state, symbol, direction, base_stake, 0,
                 duration=dur_sym,
                 feats=feats_sym,
+                notouch_entry=notouch_entry_sym,
             )
 
             # Remove from open positions after resolution
