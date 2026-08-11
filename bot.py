@@ -264,7 +264,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02
 
-MARTINGALE_FACTOR    = 1.29
+MARTINGALE_FACTOR    = 2.1
 MARTINGALE_MAX_STEPS = 3
 
 # ── v3b: Trade frequency control ──────────────────────────────────────────
