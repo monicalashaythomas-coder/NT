@@ -502,7 +502,8 @@ class SupabaseStore:
         return []
 
     def save_trade(self, symbol, direction, step, stake, won, profit,
-                   p_up, confidence, duration, feats, notouch_entry=None):
+                   p_up, confidence, duration, feats, notouch_entry=None,
+                   path_stats=None):
         votes = {}
         if feats:
             votes = {
@@ -554,6 +555,20 @@ class SupabaseStore:
                 "nt_ev":         round(notouch_entry["ev"], 6),
                 "dur_unit":      notouch_entry["dur_unit"],
             })
+        # Path-tracking columns — what price actually did during the hold,
+        # not just the terminal win/loss. These need to exist in
+        # bot_trade_log before redeploying (see path_stats_migration.sql) —
+        # otherwise every trade save fails exactly like the earlier
+        # contract_type schema-cache incident.
+        if path_stats:
+            row.update({
+                "mfe_pct":    path_stats.get("mfe_pct", 0.0),
+                "mae_pct":    path_stats.get("mae_pct", 0.0),
+                "hold_vol":   path_stats.get("hold_vol", 0.0),
+                "hold_ticks": path_stats.get("hold_ticks", 0),
+            })
+            if "closest_approach_pct" in path_stats:
+                row["closest_approach_pct"] = path_stats["closest_approach_pct"]
         self._insert("bot_trade_log", row)
 
     def save_symbol_state(self, state):
@@ -569,6 +584,9 @@ class SupabaseStore:
                 # so quarter-Kelly sizing doesn't reset to the conservative
                 # default on every Railway restart/redeploy.
                 "payout_history": json.dumps(state.payout_history.get(s, [])[-50:]),
+                # Regime-conditioned duration win rates — see regime_bucket()
+                # and monte_carlo_duration's regime_stats blending.
+                "duration_regime_stats": json.dumps(state.duration_regime_stats.get(s, {})),
                 "updated_at":     datetime.utcnow().isoformat(),
             })
         print(f"[Store] Saved state for {len(state.model_cache)} symbols to Supabase.")
@@ -595,6 +613,11 @@ class SupabaseStore:
             payouts = json.loads(raw_p) if isinstance(raw_p, str) else (raw_p or [])
             if payouts:
                 state.payout_history[s] = payouts
+            # Restore regime-conditioned duration stats
+            raw_drs = row.get("duration_regime_stats") or "{}"
+            drs = json.loads(raw_drs) if isinstance(raw_drs, str) else (raw_drs or {})
+            if drs:
+                state.duration_regime_stats[s] = drs
         print(f"[Store] Warm-started state for {len(rows)} symbols from Supabase.")
 
 
@@ -807,6 +830,11 @@ class TradeState:
         self.meta_weights: Dict[str, np.ndarray] = {}
         self.meta_bias:    Dict[str, float]       = {}
         self.last_meta_save: float = 0.0   # throttle for heartbeat meta-state saves
+        # Regime-conditioned duration performance: duration_regime_stats[symbol][bucket][duration]
+        # = {"wins": int, "total": int}. Populated at step-0 settlement, used by
+        # monte_carlo_duration to shrink duration choice toward what's actually
+        # worked in this specific market regime, not just a flat per-duration rate.
+        self.duration_regime_stats: Dict[str, Dict[str, Dict]] = {}
         # Ring buffer of (layer_vector, outcome) training examples per symbol
         self.meta_buffer:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=2000))
 
@@ -3279,9 +3307,76 @@ def autotune_gates(state):
 
 
 # ---------------------------------------------------------------------------
+# REGIME-CONDITIONED DURATION LEARNING
+# Buckets each trade's entry market state into a compact regime key, and
+# tracks realized win rate per (symbol, regime, duration). Feeds back into
+# monte_carlo_duration as an additional shrinkage-blended evidence source —
+# "which duration actually worked when the market looked like THIS" rather
+# than a flat, regime-blind per-duration rate.
+# ---------------------------------------------------------------------------
+def regime_bucket(feats: dict) -> str:
+    """Compact regime label from entry-time features. Kept small (6 buckets)
+    so live sample counts per bucket stay reachable in a reasonable time —
+    finer-grained buckets would take far longer to accumulate trust."""
+    vr = float(feats.get("vol_regime", 0.0))
+    vol_label = "lowvol" if vr < -0.3 else ("highvol" if vr > 0.3 else "midvol")
+    trend_label = "trend" if feats.get("momentum_mode", False) else "range"
+    return f"{vol_label}_{trend_label}"
+
+
+def compute_path_stats(sd, entry_time: float, settle_time: float,
+                       entry_price: float, direction: int,
+                       notouch_entry: dict = None) -> dict:
+    """Reconstructs what happened to price DURING an open contract, using the
+    symbol's already-continuously-updated tick history — no separate live
+    tracker needed, since sd.ticks keeps accumulating in the background
+    regardless of whether a trade is open.
+
+    Returns mfe_pct/mae_pct (max favorable/adverse excursion, signed to the
+    trade's direction) and hold_vol/hold_ticks. For NOTOUCH, additionally
+    returns closest_approach_pct: how close price got to the barrier during
+    the hold, as a fraction of the barrier distance (0% = touched it,
+    ~100% = never got materially closer than entry). This is the piece a
+    binary win/loss can't tell you — a win that grazed the barrier three
+    times is much weaker evidence than one that stayed clear the whole way.
+    """
+    stats = {"mfe_pct": 0.0, "mae_pct": 0.0, "hold_vol": 0.0, "hold_ticks": 0}
+    if sd is None or entry_price is None or entry_price <= 0:
+        return stats
+
+    epochs = sd.epochs()
+    prices = sd.prices()
+    if len(epochs) == 0:
+        return stats
+
+    mask = (epochs > entry_time) & (epochs <= settle_time)
+    path = prices[mask]
+    if len(path) == 0:
+        return stats
+
+    signed_moves = (path - entry_price) / entry_price * direction
+    stats["mfe_pct"]   = round(float(np.max(signed_moves)), 6)
+    stats["mae_pct"]   = round(float(np.min(signed_moves)), 6)
+    stats["hold_ticks"] = int(len(path))
+    if len(path) >= 2:
+        stats["hold_vol"] = round(float(np.std(np.diff(path) / path[:-1])), 6)
+
+    if notouch_entry is not None:
+        barrier_d = notouch_entry.get("barrier_d")
+        if barrier_d and barrier_d > 0:
+            barrier_abs = (entry_price - barrier_d if direction > 0
+                           else entry_price + barrier_d)
+            closest = float(np.min(np.abs(path - barrier_abs)))
+            stats["closest_approach_pct"] = round(
+                min(closest / barrier_d, 1.0) * 100, 2
+            )
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # LAYER 12: MONTE CARLO DURATION SELECTOR
 # ---------------------------------------------------------------------------
-def monte_carlo_duration(prices, returns, direction, feats, candidate_durations, n_sims=MC_SIMULATIONS, models=None):
+def monte_carlo_duration(prices, returns, direction, feats, candidate_durations, n_sims=MC_SIMULATIONS, models=None, regime_stats=None):
     """Takes the direction already decided by the Bayesian layer (does NOT
     re-decide direction) and simulates forward paths to find which duration
     maximizes expected win probability.
@@ -3387,6 +3482,21 @@ def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
             blended = 0.30 * sim_component + 0.70 * shrunk_emp
         else:
             blended = sim_component
+
+        # Regime-conditioned live adjustment. Same shrinkage principle as the
+        # empirical blend above (Beta(10,10) prior) so a thin-sample regime
+        # bucket barely moves the estimate, while a well-populated one
+        # (this exact market condition + this exact duration, seen many
+        # times before) can meaningfully shift it. Applied as a final,
+        # lighter-weight layer on top of the sim+empirical blend rather than
+        # replacing it — this is a refinement, not a separate authority.
+        if regime_stats:
+            rs = regime_stats.get(dur)
+            if rs and rs.get("total", 0) > 0:
+                n_regime = rs["total"]
+                regime_wins = rs["wins"]
+                shrunk_regime = (regime_wins + EMPIRICAL_PRIOR_STRENGTH * 0.5) / (n_regime + EMPIRICAL_PRIOR_STRENGTH)
+                blended = 0.75 * blended + 0.25 * shrunk_regime
 
         if best is None or blended > best[1]:
             best = (dur, blended)
@@ -3979,7 +4089,7 @@ def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
 
 
 async def execute_single_step(client, state, symbol, direction, stake, step, duration=5,
-                              feats=None, notouch_entry=None):
+                              feats=None, notouch_entry=None, sd=None):
     """Places exactly ONE trade and returns (won, profit, attempted).
 
     attempted=False means the atomic gate blocked this call before any
@@ -4005,6 +4115,15 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
 
     state.trade_in_progress = True
     won, profit = False, 0.0
+
+    # Entry snapshot for path tracking — captured before the buy call so it
+    # reflects price at (or just before) actual entry, not after any delay.
+    entry_time  = time.time()
+    entry_price = None
+    if sd is not None:
+        p = sd.prices()
+        if len(p) > 0:
+            entry_price = float(p[-1])
 
     try:
         if notouch_entry is not None:
@@ -4051,9 +4170,16 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
     # A contract_id exists past this point — real money IS at risk, so
     # everything from here on is a genuine attempted trade regardless of
     # how its outcome resolves.
+    path_stats = {}
     try:
         won, profit = await wait_for_contract_result(
             client, contract_id, max_wait=settle_max_wait
+        )
+        settle_time = time.time()
+        # Reconstruct what price did during the hold from the symbol's
+        # already-continuously-updated tick history — see compute_path_stats.
+        path_stats = compute_path_stats(
+            sd, entry_time, settle_time, entry_price, direction, notouch_entry
         )
         # Store for Supabase logging in the post-trade path
         state._last_notouch_entry = notouch_entry
@@ -4103,6 +4229,20 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
             x = MetaLearner.feats_to_vector(feats)
             MetaLearner.update(state, symbol, x, direction, won)
 
+            # ── Regime-conditioned duration stats update ────────────────────
+            # duration here is in ticks (Rise/Fall) or dur_val (NOTOUCH, in
+            # its own unit) — keyed separately via a prefix so the two never
+            # collide in the same bucket.
+            dur_key = (f"nt{notouch_entry['dur_val']}{notouch_entry['dur_unit']}"
+                      if notouch_entry else int(duration))
+            bucket = regime_bucket(feats)
+            sym_stats = state.duration_regime_stats.setdefault(symbol, {})
+            bucket_stats = sym_stats.setdefault(bucket, {})
+            dur_stats = bucket_stats.setdefault(dur_key, {"wins": 0, "total": 0})
+            dur_stats["total"] += 1
+            if won:
+                dur_stats["wins"] += 1
+
             # ── v3: CUSUM drift update ─────────────────────────────────────
             cusum_fired = DriftDetector.update_cusum(state, symbol, won)
             if cusum_fired and not state.drift_degraded.get(symbol, False):
@@ -4115,7 +4255,8 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
             _store.save_trade(symbol, direction, step, stake, won, profit,
                               state.seq_p_up, state.seq_confidence,
                               state.seq_duration, feats,
-                              notouch_entry=state._last_notouch_entry)
+                              notouch_entry=state._last_notouch_entry,
+                              path_stats=path_stats)
 
         # ── Auto-tune gates every 50 step-0 trades ─────────────────────────
         state._trades_since_autotune += 1
@@ -5017,7 +5158,8 @@ async def main():
 
                 duration_s, exp_win = monte_carlo_duration(
                     sd.prices(), sd.returns(), direction, feats, CANDIDATE_DURATIONS,
-                    models=state.model_cache.get(s)
+                    models=state.model_cache.get(s),
+                    regime_stats=state.duration_regime_stats.get(s, {}).get(regime_bucket(feats), {})
                 )
                 if exp_win < MIN_EXP_WIN_RATE:
                     continue
@@ -5058,6 +5200,7 @@ async def main():
                 state.recovery_stake, state.recovery_step,
                 duration=rec_duration,
                 feats=feats,
+                sd=symbol_data[rec_sym],
             )
 
             if not attempted:
@@ -5194,10 +5337,14 @@ async def main():
 
             # MC duration scan — auto-selects whichever candidate duration
             # (CANDIDATE_DURATIONS) maximises blended simulation + empirical
-            # win probability for the resolved direction on this symbol.
+            # win probability for the resolved direction on this symbol,
+            # refined further by regime-conditioned live performance (which
+            # duration has actually worked when the market looked like this).
+            bucket = regime_bucket(feats)
             duration, exp_win = monte_carlo_duration(
                 sd.prices(), live_returns, direction, feats, CANDIDATE_DURATIONS,
-                models=state.model_cache.get(s)
+                models=state.model_cache.get(s),
+                regime_stats=state.duration_regime_stats.get(s, {}).get(bucket, {})
             )
             rf_payout = empirical_payout(state, s)
             rf_ev     = exp_win * rf_payout - (1 - exp_win)
@@ -5308,6 +5455,7 @@ async def main():
                 duration=dur_sym,
                 feats=feats_sym,
                 notouch_entry=notouch_entry_sym,
+                sd=symbol_data[symbol],
             )
 
             # Remove from open positions after resolution
