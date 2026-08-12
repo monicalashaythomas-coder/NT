@@ -270,10 +270,10 @@ MARTINGALE_MAX_STEPS = 3
 # ── v3b: Trade frequency control ──────────────────────────────────────────
 # 60 seconds prevents genuine same-tick double-entry while letting
 # independent signals through. Quality gates — not the clock — throttle.
-MIN_TRADE_COOLDOWN = 60
+MIN_TRADE_COOLDOWN = 15
 
 # ── v3b: Recovery timeout ─────────────────────────────────────────────────
-RECOVERY_ABANDON_AFTER = 20 * 60
+RECOVERY_ABANDON_AFTER = 2000 * 60
 
 # ── Quality gates ──────────────────────────────────────────────────────────
 MIN_SCORE_GAP = 0.05
