@@ -441,7 +441,24 @@ META_MIN_SAMPLES      = 200    # minimum resolved trades before meta-learner act
 # touching existing real samples — see replay_seed_meta_buffer(). Kept below
 # META_MIN_SAMPLES so a topped-up symbol still needs some real live trades
 # before actually activating, rather than crossing the line on replay alone.
-REPLAY_TOPUP_TARGET   = 150
+# Historical replay tops up a symbol's meta_buffer toward this many samples
+# (real + replay combined) at every calibration, without exceeding it or
+# touching existing real samples — see replay_seed_meta_buffer(). Kept below
+# META_MIN_SAMPLES so a topped-up symbol still needs some real live trades
+# before actually activating, rather than crossing the line on replay alone.
+#
+# Per-symbol, not flat: RDBEAR's live sample generation has been badly
+# starved (10 real trades after 10+ hours of running, vs 40-45 for R_75/
+# R_100 — see the atomic-gate latency issue we found and fixed). Requiring
+# it to close the same 50-sample live gap as the other two would leave it
+# stalled far longer for reasons that were a bug, not a reflection of the
+# signal itself. Leaving it at 199 means RDBEAR's meta-learner will
+# effectively activate almost entirely on replay data the first time it
+# turns on — a real tradeoff (replay's diversity/pipeline-fidelity limits
+# discussed earlier apply in full here), accepted deliberately for this one
+# symbol rather than left stuck waiting on a gate that was itself broken.
+REPLAY_TOPUP_TARGET   = {"R_75": 190, "R_100": 190, "RDBEAR": 199}
+REPLAY_TOPUP_DEFAULT  = 150   # fallback for any symbol not listed above
 META_LEARNING_RATE    = 0.10   # logistic regression online update rate
 META_L2               = 0.01   # L2 regularisation weight
 
@@ -4748,7 +4765,9 @@ async def deep_startup_calibration(state, symbol_data, symbols):
             # -limiting, since a symbol that's already crossed the target
             # (or META_MIN_SAMPLES) needs nothing further from replay.
             current_n = len(state.meta_buffer[s])
-            target_n  = min(REPLAY_TOPUP_TARGET, META_MIN_SAMPLES)
+            target_n  = min(
+                REPLAY_TOPUP_TARGET.get(s, REPLAY_TOPUP_DEFAULT), META_MIN_SAMPLES
+            )
             if current_n < target_n:
                 needed = target_n - current_n
                 replay_samples = replay_seed_meta_buffer(sd, m, s, target_samples=needed)
