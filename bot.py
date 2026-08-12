@@ -264,7 +264,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02
 
-MARTINGALE_FACTOR    = 1.74
+MARTINGALE_FACTOR    = 1.29
 MARTINGALE_MAX_STEPS = 3
 
 # ── v3b: Trade frequency control ──────────────────────────────────────────
@@ -295,8 +295,8 @@ GATE_SCHEMA_VERSION = 4
 # deep_startup_calibration) do the finer-grained per-symbol calibration on
 # top of this shared layer-count gate, and autotune_gates() nudges these
 # two numbers over time from live results.
-MIN_LAYER_AGREE    = 11
-MAX_LAYER_DISAGREE = 4
+MIN_LAYER_AGREE    = 8
+MAX_LAYER_DISAGREE = 5
 
 # FIX v2: Hard cap on total stake committed in one martingale sequence.
 # If the cumulative at-risk amount would exceed this fraction of balance,
@@ -2874,6 +2874,67 @@ class MetaLearner:
         vlog(f"[MetaLearner] {symbol}: batch retrained on {len(buf)} examples")
 
 
+def replay_seed_meta_buffer(sd, models, symbol, target_samples=150, min_stride=25):
+    """
+    Warm-starts MetaLearner's buffer for `symbol` from real historical tick
+    data already fetched at startup (fetch_history), instead of waiting for
+    live trades to accumulate one at a time — see conversation: live
+    accumulation is bottlenecked by real market time (a sample only exists
+    once a real trade resolves), while replay is bottlenecked only by
+    compute time, since the historical prices already sit in memory.
+
+    HONEST TRADEOFF, disclosed rather than hidden: this reuses the models
+    already fitted on the COMPLETE available history (state.model_cache),
+    not a fresh walk-forward refit at every replay point the way
+    expanding_window_walk_forward does per fold. That means feature values
+    here come from models that "know" the whole window's statistics, not
+    just data up to each replay point — a mild look-ahead in model
+    PARAMETERS. Doing a second full nested walk-forward here instead would
+    roughly double startup calibration time for a benefit that should be
+    small in practice, since synthetic indices run a fixed, published
+    volatility model rather than a real market's shifting regime.
+    The OUTCOME LABELS have zero leakage either way: each is the true
+    realized price move over the horizon, strictly after the evaluation
+    point — the thing that actually has to be honest for this to be worth
+    anything is untouched by this simplification.
+
+    Subsamples heavily (stride, not every tick) rather than replaying every
+    single tick — consecutive ticks share almost their entire lookback
+    window, so a dense replay would be one long autocorrelated sample
+    dressed up as thousands, not real independent evidence. `min_stride`
+    enforces a floor on spacing even if the available history is short.
+    """
+    if models is None or not models.fitted:
+        return []
+    n_ticks = len(sd.ticks)
+    max_h = max(CANDIDATE_DURATIONS)
+    if n_ticks < MIN_TICKS_FOR_FIT + min_stride + max_h:
+        return []
+
+    all_ticks = list(sd.ticks)
+    mid_h     = CANDIDATE_DURATIONS[len(CANDIDATE_DURATIONS) // 2]
+    usable_range = n_ticks - MIN_TICKS_FOR_FIT - max_h
+    stride = max(min_stride, usable_range // max(target_samples, 1))
+
+    eval_sd = sd.slice_copy(MIN_TICKS_FOR_FIT)
+    samples = []
+    for idx in range(MIN_TICKS_FOR_FIT, n_ticks - max_h):
+        eval_sd.add_tick(*all_ticks[idx])
+        if (idx - MIN_TICKS_FOR_FIT) % stride != 0:
+            continue
+        feats = compute_features(eval_sd, models, {sd.symbol: eval_sd.returns()})
+        if feats is None:
+            continue
+        current_price = all_ticks[idx][1]
+        future_price  = all_ticks[idx + mid_h][1]
+        x = MetaLearner.feats_to_vector(feats)
+        y = 1.0 if future_price > current_price else 0.0
+        samples.append((x, y))
+        if len(samples) >= target_samples:
+            break
+    return samples
+
+
 # =============================================================================
 # v3 UPGRADE 3 — CONFIDENCE CALIBRATION
 # =============================================================================
@@ -4664,6 +4725,20 @@ async def deep_startup_calibration(state, symbol_data, symbols):
                 vlog(f"  Learned weights   : insufficient OOS data, using static defaults")
 
             state.model_cache[s] = m
+
+            # ── Historical replay: warm-start MetaLearner buffer ───────────
+            # Only seeds when genuinely empty — never overwrites real,
+            # already-accumulated live progress on a restart. First-ever
+            # run (or right after a Supabase wipe) is exactly when this
+            # matters: buffer starts at zero and would otherwise sit there
+            # for days-to-weeks of live trading before META_MIN_SAMPLES.
+            if len(state.meta_buffer[s]) == 0:
+                replay_samples = replay_seed_meta_buffer(sd, m, s)
+                if replay_samples:
+                    for x, y in replay_samples:
+                        state.meta_buffer[s].append((x, y))
+                    print(f"  Meta-replay       : seeded {len(replay_samples)} "
+                          f"samples from historical ticks")
 
             # ── Warm-start: blend Supabase-persisted weights ───────────────
             pending = state._pending_weights.get(s)
