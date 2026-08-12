@@ -436,6 +436,12 @@ DRIFT_STAKE_REDUCTION = 0.50
 
 # ── v3: Meta-learner settings ─────────────────────────────────────────────
 META_MIN_SAMPLES      = 200    # minimum resolved trades before meta-learner activates
+# Historical replay tops up a symbol's meta_buffer toward this many samples
+# (real + replay combined) at every calibration, without exceeding it or
+# touching existing real samples — see replay_seed_meta_buffer(). Kept below
+# META_MIN_SAMPLES so a topped-up symbol still needs some real live trades
+# before actually activating, rather than crossing the line on replay alone.
+REPLAY_TOPUP_TARGET   = 150
 META_LEARNING_RATE    = 0.10   # logistic regression online update rate
 META_L2               = 0.01   # L2 regularisation weight
 
@@ -644,6 +650,7 @@ class SupabaseStore:
                 "meta_bias":    float(state.meta_bias.get(symbol, 0.0)),
                 "meta_buffer":  json.dumps(buf_payload),
                 "buffer_len":   len(buf_payload),
+                "replay_count": int(state.meta_replay_count.get(symbol, 0)),
                 "updated_at":   datetime.utcnow().isoformat(),
             })
         if state.meta_weights:
@@ -662,6 +669,7 @@ class SupabaseStore:
             if w:
                 state.meta_weights[s] = np.array(w, dtype=float)
             state.meta_bias[s] = float(row.get("meta_bias", 0.0))
+            state.meta_replay_count[s] = int(row.get("replay_count", 0))
             raw_buf = row.get("meta_buffer") or "[]"
             buf = json.loads(raw_buf) if isinstance(raw_buf, str) else (raw_buf or [])
             if buf:
@@ -835,6 +843,11 @@ class TradeState:
         # monte_carlo_duration to shrink duration choice toward what's actually
         # worked in this specific market regime, not just a flat per-duration rate.
         self.duration_regime_stats: Dict[str, Dict[str, Dict]] = {}
+        # Tracks how many of each symbol's meta_buffer samples came from
+        # historical replay vs real live trades — same buffer/deque, but
+        # worth knowing the split when judging how much to trust a symbol's
+        # current meta-learner state (see REPLAY_TOPUP_TARGET below).
+        self.meta_replay_count: Dict[str, int] = {}
         # Ring buffer of (layer_vector, outcome) training examples per symbol
         self.meta_buffer:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=2000))
 
@@ -4726,19 +4739,31 @@ async def deep_startup_calibration(state, symbol_data, symbols):
 
             state.model_cache[s] = m
 
-            # ── Historical replay: warm-start MetaLearner buffer ───────────
-            # Only seeds when genuinely empty — never overwrites real,
-            # already-accumulated live progress on a restart. First-ever
-            # run (or right after a Supabase wipe) is exactly when this
-            # matters: buffer starts at zero and would otherwise sit there
-            # for days-to-weeks of live trading before META_MIN_SAMPLES.
-            if len(state.meta_buffer[s]) == 0:
-                replay_samples = replay_seed_meta_buffer(sd, m, s)
+            # ── Historical replay: top up MetaLearner buffer toward target ─
+            # Was previously "only if genuinely empty" — too blunt. A symbol
+            # sitting at 10 real live samples while another sits at 45
+            # deserves the same top-up a fresh cold start would get, not
+            # just the literal zero case. Tops up toward REPLAY_TOPUP_TARGET
+            # without exceeding it or touching existing real samples — self
+            # -limiting, since a symbol that's already crossed the target
+            # (or META_MIN_SAMPLES) needs nothing further from replay.
+            current_n = len(state.meta_buffer[s])
+            target_n  = min(REPLAY_TOPUP_TARGET, META_MIN_SAMPLES)
+            if current_n < target_n:
+                needed = target_n - current_n
+                replay_samples = replay_seed_meta_buffer(sd, m, s, target_samples=needed)
                 if replay_samples:
                     for x, y in replay_samples:
                         state.meta_buffer[s].append((x, y))
-                    print(f"  Meta-replay       : seeded {len(replay_samples)} "
-                          f"samples from historical ticks")
+                    state.meta_replay_count[s] = (
+                        state.meta_replay_count.get(s, 0) + len(replay_samples)
+                    )
+                    new_n = len(state.meta_buffer[s])
+                    print(f"  Meta-replay       : topped up {s} with "
+                          f"{len(replay_samples)} samples from historical "
+                          f"ticks (buffer {current_n} -> {new_n}, "
+                          f"{state.meta_replay_count[s]} of {new_n} are "
+                          f"replay-seeded)")
 
             # ── Warm-start: blend Supabase-persisted weights ───────────────
             pending = state._pending_weights.get(s)
