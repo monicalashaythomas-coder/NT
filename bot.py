@@ -264,7 +264,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02
 
-MARTINGALE_FACTOR    = 2.1
+MARTINGALE_FACTOR    = 1.29
 MARTINGALE_MAX_STEPS = 3
 
 # ── v3b: Trade frequency control ──────────────────────────────────────────
@@ -3669,19 +3669,33 @@ async def select_best_notouch(client, symbol, candidates, direction):
     Takes the top MC candidates, queries Deriv for actual payout quotes,
     computes real EV = P_no_touch × gross_payout_ratio − 1, and returns
     the best entry dict (or None if nothing clears NOTOUCH_MIN_EV).
+
+    Quotes are fetched CONCURRENTLY (asyncio.gather), not sequentially.
+    Root-cause fix: RDBEAR is the only NOTOUCH_DUAL_SYMBOLS member, so it
+    alone paid the cost of up to NOTOUCH_TOP_K=8 sequential network
+    round-trips here before ever reaching the buy call — several extra
+    seconds of latency that R_75/R_100 (plain Rise/Fall, no quote-fetch
+    loop) never pay. On a symbol trading in seconds-scale ticks, that gap
+    was enough for the fused signal to drift past the atomic gate
+    threshold by the time of firing — live logs showed RDBEAR blocked at
+    passes_layer_gate() on effectively every attempt for this exact
+    reason. Gathering bounds total latency to ~1 round-trip instead of
+    up to 8x that, without touching gate thresholds or trade logic.
     """
     if not candidates:
         return None
 
+    top = candidates[:NOTOUCH_TOP_K]
+    quotes = await asyncio.gather(
+        *[get_notouch_payout_quote(client, symbol, c["barrier_rel"],
+                                   c["dur_val"], c["dur_unit"])
+          for c in top],
+        return_exceptions=True
+    )
+
     best = None
-    for cand in candidates[:NOTOUCH_TOP_K]:
-        gross = await get_notouch_payout_quote(
-            client, symbol,
-            cand["barrier_rel"],
-            cand["dur_val"],
-            cand["dur_unit"],
-        )
-        if gross is None:
+    for cand, gross in zip(top, quotes):
+        if isinstance(gross, Exception) or gross is None:
             continue
         ev = cand["p_no_touch"] * gross - 1.0
         cand["gross_payout"] = gross
