@@ -264,7 +264,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02
 
-MARTINGALE_FACTOR    = 1.68
+MARTINGALE_FACTOR    = 1.45
 MARTINGALE_MAX_STEPS = 3
 
 # ── v3b: Trade frequency control ──────────────────────────────────────────
@@ -273,7 +273,7 @@ MARTINGALE_MAX_STEPS = 3
 MIN_TRADE_COOLDOWN = 60
 
 # ── v3b: Recovery timeout ─────────────────────────────────────────────────
-RECOVERY_ABANDON_AFTER = 2000 * 60
+RECOVERY_ABANDON_AFTER = 20 * 60
 
 # ── Quality gates ──────────────────────────────────────────────────────────
 MIN_SCORE_GAP = 0.05
@@ -295,15 +295,26 @@ GATE_SCHEMA_VERSION = 4
 # deep_startup_calibration) do the finer-grained per-symbol calibration on
 # top of this shared layer-count gate, and autotune_gates() nudges these
 # two numbers over time from live results.
-MIN_LAYER_AGREE    = 11
-MAX_LAYER_DISAGREE = 4
+MIN_LAYER_AGREE    = 8
+MAX_LAYER_DISAGREE = 5
 
 # FIX v2: Hard cap on total stake committed in one martingale sequence.
 # If the cumulative at-risk amount would exceed this fraction of balance,
 # abort the recovery rather than place the next step.
 # This would have prevented the account destruction: the bot kept recovering
 # at growing stakes while balance fell, compounding losses.
-MAX_SEQUENCE_LOSS_PCT = 0.05           # Never risk more than 5% of balance in one sequence
+MAX_SEQUENCE_LOSS_PCT = 0.80           # Never risk more than 80% of the
+                                        # BALANCE AT SEQUENCE START (fixed
+                                        # snapshot, see seq_start_balance) in
+                                        # one martingale sequence. Sized for
+                                        # a small ($2) account specifically:
+                                        # unlocks the full 3-step ladder at
+                                        # MARTINGALE_FACTOR=1.45, but means a
+                                        # full losing sequence can take the
+                                        # account from ~$2 down to ~$0.40.
+                                        # Revisit this if the account is
+                                        # funded larger — 80% is not a sane
+                                        # default at any bigger balance.
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
 SCHEDULED_CALIBRATION_INTERVAL = 6 * 60 * 60   # 6-hour absolute backstop (v2 compat line)
@@ -811,6 +822,14 @@ class TradeState:
         # FIX v2: Track stake committed so far in the current martingale
         # sequence. Abort if cumulative risk exceeds MAX_SEQUENCE_LOSS_PCT.
         self.seq_stakes_committed = 0.0
+        # Balance snapshotted once, at the moment a sequence starts (first
+        # step-0 loss triggering recovery) — NOT recomputed live each step.
+        # The guard needs a fixed reference point to mean "X% of capital
+        # risked this sequence"; checking against the live, shrinking
+        # balance instead made the ratio worsen mechanically every step,
+        # making no fixed percentage able to unlock a multi-step ladder
+        # regardless of its value. 0.0 means no sequence in progress.
+        self.seq_start_balance = 0.0
 
         # FIX v2: Direction balance tracking.
         # A rolling window of the last 30 trade directions (+1=CALL, -1=PUT).
@@ -4415,6 +4434,7 @@ def clear_recovery(state):
     state.recovery_step       = 0
     state.recovery_stake      = 0.0
     state.seq_stakes_committed = 0.0   # FIX v2: reset sequence loss guard
+    state.seq_start_balance   = 0.0    # reset fixed sequence-start snapshot
 
 
 def reset_sequence_accumulator(state, balance_now, p_up=0.5, confidence=0.0, duration=0):
@@ -5373,14 +5393,20 @@ async def main():
                     clear_recovery(state)
                     await deep_startup_calibration(state, symbol_data, symbols)
                 else:
-                    # FIX v2: Sequence loss guard — abort if cumulative risk
-                    # would exceed MAX_SEQUENCE_LOSS_PCT of current balance.
+                    # FIX v2 (corrected): Sequence loss guard — abort if
+                    # cumulative risk would exceed MAX_SEQUENCE_LOSS_PCT of
+                    # the balance AT SEQUENCE START, fixed, not recomputed
+                    # against the live shrinking balance each step (that
+                    # version made the ratio worsen mechanically every step,
+                    # so no fixed percentage could ever unlock more than one
+                    # recovery step, regardless of its value).
                     state.seq_stakes_committed += state.recovery_stake
-                    max_allowed = state.balance * MAX_SEQUENCE_LOSS_PCT
+                    max_allowed = state.seq_start_balance * MAX_SEQUENCE_LOSS_PCT
                     if state.seq_stakes_committed + next_stake > max_allowed:
                         print(f"[Recovery] SEQUENCE LOSS GUARD triggered — "
                               f"committed={state.seq_stakes_committed:.2f} "
-                              f"next={next_stake:.2f} > max={max_allowed:.2f}. "
+                              f"next={next_stake:.2f} > max={max_allowed:.2f} "
+                              f"(seq_start_balance={state.seq_start_balance:.2f}). "
                               f"Aborting sequence to protect balance.")
                         emit_sequence_summary(state, rec_sym, rec_dir, False)
                         clear_recovery(state)
@@ -5621,11 +5647,15 @@ async def main():
             else:
                 next_stake = round(base_stake * MARTINGALE_FACTOR, 2)
                 cumulative = base_stake
-                max_allowed = state.balance * MAX_SEQUENCE_LOSS_PCT
+                # Sequence-start snapshot — fixed here, not recomputed live
+                # on later steps. See seq_start_balance comment in TradeState.
+                seq_start_bal = state.balance
+                max_allowed = seq_start_bal * MAX_SEQUENCE_LOSS_PCT
                 if MARTINGALE_MAX_STEPS >= 1 and cumulative + next_stake <= max_allowed:
                     state.recovery_step           = 1
                     state.recovery_stake          = next_stake
                     state.seq_stakes_committed    = cumulative
+                    state.seq_start_balance       = seq_start_bal
                     state.recovery_start_time     = time.time()
                     print(f"[Recovery] {symbol} step=0 loss — "
                           f"recovery step=1 stake={next_stake:.2f} "
