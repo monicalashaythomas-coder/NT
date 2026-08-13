@@ -264,16 +264,16 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02
 
-MARTINGALE_FACTOR    = 2.10
+MARTINGALE_FACTOR    = 1.29
 MARTINGALE_MAX_STEPS = 3
 
 # ── v3b: Trade frequency control ──────────────────────────────────────────
 # 60 seconds prevents genuine same-tick double-entry while letting
 # independent signals through. Quality gates — not the clock — throttle.
-MIN_TRADE_COOLDOWN = 15
+MIN_TRADE_COOLDOWN = 60
 
 # ── v3b: Recovery timeout ─────────────────────────────────────────────────
-RECOVERY_ABANDON_AFTER = 2000 * 60
+RECOVERY_ABANDON_AFTER = 20 * 60
 
 # ── Quality gates ──────────────────────────────────────────────────────────
 MIN_SCORE_GAP = 0.05
@@ -350,7 +350,16 @@ TRADE_SYMBOLS = ["R_75", "R_100", "RDBEAR"]
 ALLOWED_DIRECTIONS = {
     "R_75":   (1, -1),   # Rise/Fall, either direction
     "R_100":  (1, -1),   # Rise/Fall, either direction
-    "RDBEAR": (-1,),     # Fall (PUT) only
+    # RDBEAR disabled ahead of the real-money switch: its meta-learner is
+    # ~91% historical-replay-derived (only 18 real trades ever, vs 66-82 for
+    # R_75/R_100), its throughput stayed badly starved even after the
+    # concurrent-quote latency fix (~1 real trade per 6 hours), and its
+    # learned bias term kept growing more positive over time while barely
+    # gaining real data — a trend, not just a one-off reading. An empty
+    # tuple means no direction ever passes Gate 4, so RDBEAR never trades;
+    # calibration/feature computation still run harmlessly in the
+    # background. To re-enable, restore ("-1",) — Fall/PUT only.
+    "RDBEAR": (),
 }
 
 # v4.1 — DUAL CONTRACT-TYPE SYMBOLS: for symbols listed here, each cycle
