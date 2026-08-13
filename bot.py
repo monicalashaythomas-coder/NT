@@ -264,7 +264,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02
 
-MARTINGALE_FACTOR    = 1.29
+MARTINGALE_FACTOR    = 1.68
 MARTINGALE_MAX_STEPS = 3
 
 # ── v3b: Trade frequency control ──────────────────────────────────────────
@@ -273,7 +273,7 @@ MARTINGALE_MAX_STEPS = 3
 MIN_TRADE_COOLDOWN = 60
 
 # ── v3b: Recovery timeout ─────────────────────────────────────────────────
-RECOVERY_ABANDON_AFTER = 20 * 60
+RECOVERY_ABANDON_AFTER = 2000 * 60
 
 # ── Quality gates ──────────────────────────────────────────────────────────
 MIN_SCORE_GAP = 0.05
@@ -295,8 +295,8 @@ GATE_SCHEMA_VERSION = 4
 # deep_startup_calibration) do the finer-grained per-symbol calibration on
 # top of this shared layer-count gate, and autotune_gates() nudges these
 # two numbers over time from live results.
-MIN_LAYER_AGREE    = 8
-MAX_LAYER_DISAGREE = 5
+MIN_LAYER_AGREE    = 11
+MAX_LAYER_DISAGREE = 4
 
 # FIX v2: Hard cap on total stake committed in one martingale sequence.
 # If the cumulative at-risk amount would exceed this fraction of balance,
